@@ -2,20 +2,26 @@ import random
 import asyncio
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, ContextTypes, filters
-
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import torch
 
 BOT_TOKEN = "8583192474:AAESPvmGIcu8iRLjrqRlgSFL7DsqrWzZ-Rk"
+MODEL_NAME = "microsoft/DialoGPT-small"
 
-tokenizer = AutoTokenizer.from_pretrained("microsoft/DialoGPT-small")
-model = AutoModelForCausalLM.from_pretrained("microsoft/DialoGPT-small")
+# Load AI model
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+model = AutoModelForCausalLM.from_pretrained(MODEL_NAME)
 
 async def reply_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
+    msg = update.effective_message  # ✅ SAFE message object
+
+    if not msg or not msg.text:
+        return
+
+    text = msg.text.strip()
 
     # Group: reply only on mention
-    if update.message.chat.type in ["group", "supergroup"]:
+    if msg.chat.type in ["group", "supergroup"]:
         if context.bot.username.lower() not in text.lower():
             return
 
@@ -42,13 +48,20 @@ async def reply_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Haha 😄",
             "Interesting 👀",
             "Arre bhai 😂",
-            "Samajh raha hoon 😌"
+            "Samajh raha hoon 😌",
+            "Chill kar 😄"
         ])
 
-    await update.message.reply_text(reply)
+    await msg.reply_text(reply)
 
-app = ApplicationBuilder().token(BOT_TOKEN).build()
-app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, reply_ai))
+def main():
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-print("Human AI bot running on Railway...")
-app.run_polling()
+    # ✅ TEXT only, safe handler
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, reply_ai))
+
+    print("Human AI bot running on Railway...")
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
